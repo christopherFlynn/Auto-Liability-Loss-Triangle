@@ -4,6 +4,8 @@
 
 ---
 
+[View the R Publication](https://rpubs.com/christopherflynndev/loss_reserving_CLBF)
+
 ## Overview
 
 One of the most important challenges in insurance is knowing how much money to set aside today for claims that won't fully settle until years in the future. This project demonstrates two foundational actuarial methods for answering that question:
