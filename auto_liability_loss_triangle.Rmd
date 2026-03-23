@@ -1,0 +1,707 @@
+---
+title: "Loss Reserving in Auto Liability: Chain Ladder & Bornhuetter-Ferguson"
+author: "Christopher Flynn"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+------------------------------------------------------------------------
+
+## Introduction
+
+When an auto liability insurance claim is reported, the insurer rarely
+knows exactly how much it will ultimately cost. A fender-bender might
+settle quickly; a serious injury claim could take years to resolve. This
+creates a fundamental challenge for insurance companies: **how do you
+set aside enough money today to pay claims that won't fully develop
+until the future?**
+
+The answer lies in **loss reserving** — a set of actuarial techniques
+that use historical claims data to estimate how much money an insurer
+will ultimately owe. This project walks through two widely used methods:
+
+1.  **Chain Ladder (Development Method)** — projects future losses by
+    assuming historical payment patterns repeat themselves.
+2.  **Bornhuetter-Ferguson (BF)** — blends the Chain Ladder projection
+    with an independent estimate of expected losses, giving more
+    stability for immature accident years.
+
+We'll build everything from scratch: generating synthetic claims data,
+constructing a loss triangle, and applying both methods — all in
+reproducible R code.
+
+------------------------------------------------------------------------
+
+## Glossary of Key Terms
+
+Before diving into the data, here's a plain-language guide to the
+terminology used throughout this analysis.
+
+| Term | Definition |
+|------------------------------------|------------------------------------|
+| **Accident Year** | The calendar year in which a loss event (accident) occurred. Claims are grouped by when the accident happened, not when they were reported or paid. |
+| **Development Lag** | How many years have passed since the accident year. Lag 1 = the year of the accident; Lag 2 = one year later; and so on. |
+| **Paid Losses** | The actual dollars an insurer has paid out on claims so far — cash out the door. |
+| **Reported (Incurred) Losses** | Paid losses *plus* case reserves — the insurer's best estimate of what each open claim will ultimately cost. |
+| **Loss Triangle** | A matrix where rows are accident years and columns are development lags. Each cell shows cumulative losses as of a given lag. The upper-left portion is observed; the lower-right is unknown and must be estimated. |
+| **Age-to-Age Factor (LDF)** | A multiplier that describes how much losses grow from one development lag to the next. Also called a Loss Development Factor. |
+| **Tail Factor** | A factor applied beyond the last observed development period to capture any remaining loss development. |
+| **Ultimate Losses** | The total amount an insurer expects to pay on a group of claims once all development is complete. |
+| **IBNR** | Incurred But Not Reported — losses that have occurred but haven't yet been fully recognized in the insurer's books. IBNR = Ultimate − Reported to Date. |
+| **A Priori Loss Ratio** | An independent, upfront estimate of losses as a percentage of premium. Used in the BF method. |
+| **Expected Losses** | Premium × A Priori Loss Ratio. The baseline estimate of what losses *should* be before looking at actual data. |
+
+------------------------------------------------------------------------
+
+## Part 1: Generating Synthetic Claims Data
+
+### Why Synthetic Data?
+
+Real insurance claims data is confidential and proprietary. For this
+portfolio demonstration, we'll simulate a realistic dataset for a
+fictitious auto liability book of business. The data is designed to
+mimic real-world patterns: losses develop slowly in early lags, then
+taper off as claims close.
+
+### The Simulation
+
+We'll generate **individual claims** with the following fields:
+
+-   `claim_id` — a unique identifier for each claim
+-   `accident_year` — the year the accident occurred (2017–2024)
+-   `development_lag` — years of development observed (1–8)
+-   `paid_losses` — cumulative paid losses as of that lag
+-   `reported_losses` — cumulative reported (incurred) losses as of that
+    lag
+-   `claim_count` — number of claims in that accident year / lag
+    combination
+-   `premium` — earned premium for that accident year (used in BF)
+
+```{r generate-data}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+set.seed(42)  # Ensures reproducibility — anyone running this gets the same numbers
+
+# ── Parameters ──────────────────────────────────────────────────────────────────
+accident_years  <- 2017:2024
+n_lags          <- 8
+n_claims_range  <- c(180, 320)   # Claims per accident year
+
+# Premium grows modestly each year (reflects a growing book of business)
+premiums <- tibble(
+  accident_year = accident_years,
+  premium       = round(seq(8e6, 11.5e6, length.out = 8), -3)
+)
+
+# ── Development pattern ──────────────────────────────────────────────────────────
+# These cumulative % factors describe how much of ultimate losses are paid by each lag.
+# Auto liability tends to develop faster than, say, workers' comp.
+cum_pct_paid <- c(0.38, 0.62, 0.76, 0.85, 0.91, 0.95, 0.98, 1.00)
+cum_pct_rptd <- c(0.65, 0.82, 0.90, 0.95, 0.97, 0.98, 0.99, 1.00)
+
+# ── Ultimate loss ratio assumptions ─────────────────────────────────────────────
+# Each accident year has a slightly different underlying loss ratio, reflecting
+# real-world variability in claim severity and frequency.
+ult_loss_ratios <- c(0.68, 0.71, 0.74, 0.70, 0.73, 0.75, 0.72, 0.70)
+
+# ── Build the claims dataset ─────────────────────────────────────────────────────
+claims_list <- list()
+
+for (i in seq_along(accident_years)) {
+  ay      <- accident_years[i]
+  prem    <- premiums$premium[i]
+  ult_lr  <- ult_loss_ratios[i]
+  ult_loss <- prem * ult_lr
+
+  # The current calendar year is 2024, so accident year 2017 has 8 lags of
+  # development, 2018 has 7, ..., 2024 has only 1.
+  max_lag <- n_lags - (i - 1)   # most-recent AY has fewest lags observed
+
+  n_claims <- sample(seq(n_claims_range[1], n_claims_range[2]), 1)
+
+  for (lag in 1:max_lag) {
+    # Add realistic noise around the expected development percentages
+    noise_paid <- rnorm(1, 0, 0.015)
+    noise_rptd <- rnorm(1, 0, 0.010)
+
+    paid_pct <- min(max(cum_pct_paid[lag] + noise_paid, 0.01), 1.00)
+    rptd_pct <- min(max(cum_pct_rptd[lag] + noise_rptd, paid_pct), 1.00)
+
+    claims_list[[length(claims_list) + 1]] <- tibble(
+      claim_id      = paste0("AY", ay, "-L", lag),
+      accident_year = ay,
+      development_lag = lag,
+      claim_count   = round(n_claims * paid_pct),
+      paid_losses   = round(ult_loss * paid_pct, 0),
+      reported_losses = round(ult_loss * rptd_pct, 0),
+      premium       = prem
+    )
+  }
+}
+
+claims_df <- bind_rows(claims_list)
+
+# Preview the first several rows
+claims_df %>%
+  head(16) %>%
+  mutate(across(c(paid_losses, reported_losses, premium), dollar)) %>%
+  kable(caption = "Sample of Synthetic Auto Liability Claims Data",
+        align   = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+```{r export-csv}
+# Export the full dataset as a CSV for sharing / reproducibility
+write_csv(claims_df, "auto_liability_claims.csv")
+cat("✓ Exported", nrow(claims_df), "rows to auto_liability_claims.csv\n")
+```
+
+A quick summary of what we just built:
+
+```{r data-summary}
+claims_df %>%
+  group_by(accident_year) %>%
+  summarise(
+    lags_observed   = max(development_lag),
+    total_claims    = max(claim_count),
+    paid_at_latest  = dollar(max(paid_losses)),
+    rptd_at_latest  = dollar(max(reported_losses)),
+    premium         = dollar(first(premium))
+  ) %>%
+  kable(caption = "Summary by Accident Year (latest diagonal)",
+        col.names = c("Accident Year", "Lags Observed", "# Claims",
+                      "Paid to Date", "Reported to Date", "Premium"),
+        align = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+------------------------------------------------------------------------
+
+## Part 2: Building the Loss Triangle
+
+### What Is a Loss Triangle?
+
+A **loss triangle** is the backbone of most reserving analyses. Imagine
+laying out your claims data in a grid:
+
+-   **Rows** = Accident Years (2017 through 2024)
+-   **Columns** = Development Lags (Year 1 through Year 8)
+-   **Each cell** = Cumulative losses as of that lag for that accident
+    year
+
+The result looks like a triangle because more-recent accident years have
+fewer development periods observed — we can only see data through the
+current calendar year. The lower-right portion of the grid is *blank* —
+that's exactly what we need to estimate.
+
+```{r build-triangle}
+# ── Paid Loss Triangle ───────────────────────────────────────────────────────────
+paid_triangle <- claims_df %>%
+  select(accident_year, development_lag, paid_losses) %>%
+  pivot_wider(
+    names_from   = development_lag,
+    values_from  = paid_losses,
+    names_prefix = "Lag_"
+  ) %>%
+  arrange(accident_year) %>%
+  column_to_rownames("accident_year")
+
+# ── Reported Loss Triangle ───────────────────────────────────────────────────────
+rptd_triangle <- claims_df %>%
+  select(accident_year, development_lag, reported_losses) %>%
+  pivot_wider(
+    names_from   = development_lag,
+    values_from  = reported_losses,
+    names_prefix = "Lag_"
+  ) %>%
+  arrange(accident_year) %>%
+  column_to_rownames("accident_year")
+
+# Display the paid triangle with NA cells shown as "—"
+paid_triangle %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), "—", dollar(.)))) %>%
+  kable(caption = "Cumulative Paid Loss Triangle — Auto Liability (2017–2024)",
+        align   = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  column_spec(1:8, width = "10%")
+```
+
+```{r display-rptd-triangle}
+rptd_triangle %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), "—", dollar(.)))) %>%
+  kable(caption = "Cumulative Reported Loss Triangle — Auto Liability (2017–2024)",
+        align   = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE)
+```
+
+Notice the staircase pattern: accident year 2017 has all 8 lags filled
+in, while accident year 2024 has only Lag 1 visible. The goal of our
+reserving methods is to fill in the missing cells and sum up what we
+expect each accident year to ultimately cost.
+
+------------------------------------------------------------------------
+
+## Part 3: Chain Ladder Method
+
+### How Chain Ladder Works
+
+The **Chain Ladder method** (also called the Development Method) is
+built on one key assumption: *the way losses develop over time in the
+past will continue in the future.*
+
+The process has three steps:
+
+1.  **Calculate Age-to-Age Factors (LDFs)** — for each pair of
+    consecutive lags, how much did cumulative losses multiply from one
+    lag to the next? Average these across all accident years to get a
+    single factor per transition.
+2.  **Apply the factors forward** — starting from the latest known
+    diagonal, multiply each accident year's current losses by the
+    appropriate LDFs to project out to ultimate.
+3.  **Compute IBNR** — Ultimate minus what's already been reported = the
+    reserve needed.
+
+### Step 1: Calculate Age-to-Age Factors
+
+```{r cl-ldfs}
+# ── Volume-weighted age-to-age factors ──────────────────────────────────────────
+# Volume-weighting sums numerators and denominators separately before dividing.
+# This gives more weight to larger accident years and is the actuarial standard.
+
+compute_ldfs <- function(triangle) {
+  n_rows <- nrow(triangle)
+  n_cols <- ncol(triangle)
+  ldfs   <- numeric(n_cols - 1)
+
+  for (j in 1:(n_cols - 1)) {
+    # Only use rows where BOTH the current and next lag are observed
+    numerator   <- sum(triangle[, j + 1], na.rm = TRUE)
+    denominator <- sum(triangle[1:(n_rows - j), j], na.rm = TRUE)
+    ldfs[j]     <- numerator / denominator
+  }
+  ldfs
+}
+
+paid_ldfs <- compute_ldfs(as.matrix(paid_triangle))
+rptd_ldfs <- compute_ldfs(as.matrix(rptd_triangle))
+
+# Add a tail factor of 1.000 (assuming development is complete at Lag 8)
+tail_factor <- 1.000
+paid_ldfs_full <- c(paid_ldfs, tail_factor)
+rptd_ldfs_full <- c(rptd_ldfs, tail_factor)
+
+ldf_table <- tibble(
+  Transition  = c(paste0("Lag ", 1:7, " → ", 2:8), "Lag 8 → Ult"),
+  `Paid LDF`  = round(paid_ldfs_full, 4),
+  `Rptd LDF`  = round(rptd_ldfs_full, 4)
+)
+
+ldf_table %>%
+  kable(caption = "Age-to-Age Loss Development Factors (LDFs)",
+        align   = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+> **Reading the table:** A Paid LDF of, say, 1.63 from Lag 1 → Lag 2
+> means that, on average, cumulative paid losses grew by 63% between the
+> first and second year of development. Factors closer to 1.000 in later
+> lags indicate that most losses have already been paid and little
+> development remains.
+
+### Step 2 & 3: Project to Ultimate and Calculate IBNR
+
+```{r cl-ultimate}
+# ── Cumulative-to-Ultimate (CDF) factors ────────────────────────────────────────
+# The CDF at lag j = product of all LDFs from lag j onward.
+# This tells us: "multiply current losses by this factor to get ultimate."
+
+compute_cdfs <- function(ldfs_full) {
+  n <- length(ldfs_full)
+  cdfs <- numeric(n)
+  cdfs[n] <- ldfs_full[n]
+  for (j in (n - 1):1) {
+    cdfs[j] <- ldfs_full[j] * cdfs[j + 1]
+  }
+  cdfs
+}
+
+paid_cdfs <- compute_cdfs(paid_ldfs_full)
+rptd_cdfs <- compute_cdfs(rptd_ldfs_full)
+
+# ── Extract the latest diagonal ──────────────────────────────────────────────────
+# For each accident year, find its most recent observed value.
+get_latest_diagonal <- function(triangle) {
+  apply(triangle, 1, function(row) {
+    vals <- row[!is.na(row)]
+    if (length(vals) == 0) NA else tail(vals, 1)
+  })
+}
+
+latest_paid <- get_latest_diagonal(as.matrix(paid_triangle))
+latest_rptd <- get_latest_diagonal(as.matrix(rptd_triangle))
+
+# The lag at which each accident year currently sits
+current_lag <- sapply(as.data.frame(t(paid_triangle)), function(col) {
+  sum(!is.na(col))
+})
+current_lag <- apply(as.matrix(paid_triangle), 1, function(row) sum(!is.na(row)))
+
+# ── Compute ultimate and IBNR ────────────────────────────────────────────────────
+cl_results <- tibble(
+  accident_year       = accident_years,
+  current_lag         = current_lag,
+  paid_to_date        = latest_paid,
+  reported_to_date    = latest_rptd,
+  paid_cdf            = paid_cdfs[current_lag],
+  rptd_cdf            = rptd_cdfs[current_lag],
+  cl_ultimate_paid    = round(latest_paid * paid_cdfs[current_lag], 0),
+  cl_ultimate_rptd    = round(latest_rptd * rptd_cdfs[current_lag], 0),
+  ibnr_paid_basis     = round(latest_paid * paid_cdfs[current_lag] - latest_rptd, 0),
+  ibnr_rptd_basis     = round(latest_rptd * rptd_cdfs[current_lag] - latest_rptd, 0)
+)
+
+cl_results %>%
+  mutate(
+    paid_to_date     = dollar(paid_to_date),
+    reported_to_date = dollar(reported_to_date),
+    paid_cdf         = round(paid_cdf, 4),
+    rptd_cdf         = round(rptd_cdf, 4),
+    cl_ultimate_rptd = dollar(cl_ultimate_rptd),
+    ibnr_rptd_basis  = dollar(ibnr_rptd_basis)
+  ) %>%
+  select(accident_year, current_lag, reported_to_date, rptd_cdf,
+         cl_ultimate_rptd, ibnr_rptd_basis) %>%
+  kable(
+    caption = "Chain Ladder Results — Reported Basis",
+    col.names = c("Accident Year", "Current Lag", "Reported to Date",
+                  "CDF to Ult", "CL Ultimate", "CL IBNR"),
+    align = "c"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r cl-total}
+cat("Chain Ladder Total IBNR (Reported Basis):",
+    dollar(sum(cl_results$ibnr_rptd_basis)), "\n")
+cat("Chain Ladder Total Ultimate (Reported Basis):",
+    dollar(sum(cl_results$cl_ultimate_rptd)), "\n")
+```
+
+------------------------------------------------------------------------
+
+## Part 4: Bornhuetter-Ferguson Method
+
+### Why BF?
+
+The Chain Ladder method is powerful, but it has a known weakness: **for
+very recent accident years with little development, it leans heavily on
+immature data.** If accident year 2024 has only one lag of history,
+multiplying it by a large CDF amplifies any early-period noise.
+
+The **Bornhuetter-Ferguson (BF) method** was introduced by Ronald
+Bornhuetter and Ronald Ferguson in a landmark 1972 paper. Their insight:
+blend two sources of information.
+
+-   **What the data says** — actual losses reported to date (like Chain
+    Ladder uses).
+-   **What we expected** — a priori expected losses based on premium and
+    an assumed loss ratio, set independently before looking at the data.
+
+The BF ultimate estimate is:
+
+> **BF Ultimate = Reported to Date + Expected Unreported Losses**
+
+Where *Expected Unreported Losses* = Expected Ultimate × (1 − 1/CDF).
+
+The term `(1 − 1/CDF)` is the **percent unreported** — how much of
+ultimate losses we'd expect to *not yet be* in the data at the current
+lag.
+
+For mature accident years (CDF near 1.0), BF gives nearly the same
+answer as Chain Ladder. For immature years, BF is more stable because it
+leans on the a priori expectation rather than extrapolating from thin
+data.
+
+### A Priori Expected Losses
+
+```{r bf-setup}
+# ── A priori loss ratios ─────────────────────────────────────────────────────────
+# In practice, these would come from pricing, industry benchmarks, or management
+# judgment. Here we use slightly smoothed versions of our true simulation ratios.
+apriori_lr <- c(0.70, 0.70, 0.72, 0.72, 0.73, 0.73, 0.72, 0.71)
+
+bf_inputs <- cl_results %>%
+  mutate(
+    premium           = premiums$premium,
+    apriori_lr        = apriori_lr,
+    expected_ultimate = round(premium * apriori_lr, 0),
+    pct_unreported    = round(1 - 1 / rptd_cdf, 4),   # Expected % still to develop
+    expected_unreptd  = round(expected_ultimate * pct_unreported, 0)
+  )
+
+bf_inputs %>%
+  mutate(
+    premium           = dollar(premium),
+    expected_ultimate = dollar(expected_ultimate),
+    expected_unreptd  = dollar(expected_unreptd)
+  ) %>%
+  select(accident_year, premium, apriori_lr, expected_ultimate,
+         pct_unreported, expected_unreptd) %>%
+  kable(
+    caption = "BF Method — A Priori Inputs",
+    col.names = c("Accident Year", "Premium", "A Priori LR",
+                  "Expected Ultimate", "% Unreported", "Expected Unreported"),
+    align = "c"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### BF Ultimate and IBNR
+
+```{r bf-ultimate}
+bf_results <- bf_inputs %>%
+  mutate(
+    bf_ultimate = round(reported_to_date + expected_unreptd, 0),
+    bf_ibnr     = round(bf_ultimate - reported_to_date, 0)
+  )
+
+bf_results %>%
+  mutate(
+    reported_to_date = dollar(reported_to_date),
+    expected_unreptd = dollar(expected_unreptd),
+    bf_ultimate      = dollar(bf_ultimate),
+    bf_ibnr          = dollar(bf_ibnr)
+  ) %>%
+  select(accident_year, reported_to_date, expected_unreptd, bf_ultimate, bf_ibnr) %>%
+  kable(
+    caption = "Bornhuetter-Ferguson Results — Reported Basis",
+    col.names = c("Accident Year", "Reported to Date", "Expected Unreported",
+                  "BF Ultimate", "BF IBNR"),
+    align = "c"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r bf-total}
+cat("BF Total IBNR:", dollar(sum(bf_results$bf_ibnr)), "\n")
+cat("BF Total Ultimate:", dollar(sum(bf_results$bf_ultimate)), "\n")
+```
+
+------------------------------------------------------------------------
+
+## Part 5: Method Comparison & Visualization
+
+### Side-by-Side: Chain Ladder vs. BF
+
+```{r comparison-table}
+comparison <- tibble(
+  accident_year    = accident_years,
+  reported_to_date = cl_results$reported_to_date,
+  cl_ultimate      = cl_results$cl_ultimate_rptd,
+  cl_ibnr          = cl_results$ibnr_rptd_basis,
+  bf_ultimate      = bf_results$bf_ultimate,
+  bf_ibnr          = bf_results$bf_ibnr,
+  diff_ibnr        = bf_results$bf_ibnr - cl_results$ibnr_rptd_basis
+)
+
+comparison %>%
+  mutate(across(c(reported_to_date, cl_ultimate, cl_ibnr,
+                  bf_ultimate, bf_ibnr, diff_ibnr), dollar)) %>%
+  kable(
+    caption = "Chain Ladder vs. Bornhuetter-Ferguson — Full Comparison",
+    col.names = c("Accident Year", "Reported to Date",
+                  "CL Ultimate", "CL IBNR",
+                  "BF Ultimate", "BF IBNR",
+                  "BF − CL IBNR"),
+    align = "c"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE) %>%
+  row_spec(which(abs(bf_results$bf_ibnr - cl_results$ibnr_rptd_basis) ==
+                   max(abs(bf_results$bf_ibnr - cl_results$ibnr_rptd_basis))),
+           bold = TRUE, background = "#fff3cd")
+```
+
+### Ultimate Loss Estimates by Accident Year
+
+```{r plot-ultimates, fig.cap="Chain Ladder vs. BF Ultimate Estimates by Accident Year"}
+plot_data <- comparison %>%
+  select(accident_year, cl_ultimate, bf_ultimate) %>%
+  pivot_longer(cols = c(cl_ultimate, bf_ultimate),
+               names_to = "method", values_to = "ultimate") %>%
+  mutate(method = recode(method,
+                         "cl_ultimate" = "Chain Ladder",
+                         "bf_ultimate" = "Bornhuetter-Ferguson"))
+
+ggplot(plot_data, aes(x = factor(accident_year), y = ultimate, fill = method)) +
+  geom_col(position = "dodge", width = 0.65, alpha = 0.88) +
+  geom_text(aes(label = paste0("$", round(ultimate / 1e6, 2), "M")),
+            position = position_dodge(width = 0.65),
+            vjust = -0.4, size = 3.2, fontface = "bold") +
+  scale_y_continuous(labels = label_dollar(scale = 1e-6, suffix = "M"),
+                     expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = c("Chain Ladder" = "#2c7bb6", "Bornhuetter-Ferguson" = "#d7191c")) +
+  labs(
+    title    = "Projected Ultimate Losses by Accident Year",
+    subtitle = "Auto Liability | Chain Ladder vs. Bornhuetter-Ferguson",
+    x        = "Accident Year",
+    y        = "Ultimate Losses",
+    fill     = "Method",
+    caption  = "Note: Based on synthetic data generated for illustration purposes."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(color = "grey40"),
+    legend.position = "top",
+    panel.grid.major.x = element_blank()
+  )
+```
+
+### IBNR by Accident Year
+
+```{r plot-ibnr, fig.cap="IBNR Estimates: Chain Ladder vs. BF"}
+ibnr_data <- comparison %>%
+  select(accident_year, cl_ibnr, bf_ibnr) %>%
+  pivot_longer(cols = c(cl_ibnr, bf_ibnr),
+               names_to = "method", values_to = "ibnr") %>%
+  mutate(method = recode(method,
+                         "cl_ibnr" = "Chain Ladder",
+                         "bf_ibnr" = "Bornhuetter-Ferguson"))
+
+ggplot(ibnr_data, aes(x = factor(accident_year), y = ibnr, fill = method)) +
+  geom_col(position = "dodge", width = 0.65, alpha = 0.88) +
+  scale_y_continuous(labels = label_dollar(scale = 1e-6, suffix = "M"),
+                     expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c("Chain Ladder" = "#2c7bb6", "Bornhuetter-Ferguson" = "#d7191c")) +
+  labs(
+    title    = "IBNR Reserves by Accident Year",
+    subtitle = "Difference is largest for the most recent (immature) accident years",
+    x        = "Accident Year",
+    y        = "IBNR",
+    fill     = "Method",
+    caption  = "IBNR = Estimated Ultimate − Reported to Date"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(color = "grey40"),
+    legend.position = "top",
+    panel.grid.major.x = element_blank()
+  )
+```
+
+### Development Pattern Visualization
+
+```{r plot-development, fig.cap="Loss Development Pattern by Lag"}
+dev_data <- claims_df %>%
+  group_by(accident_year, development_lag) %>%
+  summarise(reported_losses = max(reported_losses), .groups = "drop") %>%
+  group_by(accident_year) %>%
+  mutate(pct_of_latest = reported_losses / max(reported_losses)) %>%
+  ungroup()
+
+ggplot(dev_data, aes(x = development_lag, y = reported_losses / 1e6,
+                     color = factor(accident_year), group = accident_year)) +
+  geom_line(linewidth = 1.1, alpha = 0.8) +
+  geom_point(size = 2.5) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = 1:8) +
+  scale_y_continuous(labels = label_dollar(suffix = "M")) +
+  labs(
+    title  = "Cumulative Reported Loss Development by Accident Year",
+    x      = "Development Lag (Years)",
+    y      = "Cumulative Reported Losses ($M)",
+    color  = "Accident Year"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 15),
+    legend.position = "right"
+  )
+```
+
+------------------------------------------------------------------------
+
+## Part 6: Summary & Conclusions
+
+```{r final-summary}
+summary_tbl <- tibble(
+  Metric              = c("Total Reported to Date", "Chain Ladder Ultimate",
+                           "Chain Ladder IBNR", "BF Ultimate", "BF IBNR"),
+  Value               = c(
+    dollar(sum(cl_results$reported_to_date)),
+    dollar(sum(cl_results$cl_ultimate_rptd)),
+    dollar(sum(cl_results$ibnr_rptd_basis)),
+    dollar(sum(bf_results$bf_ultimate)),
+    dollar(sum(bf_results$bf_ibnr))
+  )
+)
+
+summary_tbl %>%
+  kable(caption = "Portfolio Summary — All Accident Years Combined", align = "lr") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(c(3, 5), bold = TRUE, background = "#e8f4f8")
+```
+
+### Key Takeaways
+
+**Chain Ladder** is intuitive and data-driven, but it amplifies noise in
+immature accident years. Notice how the Chain Ladder IBNR for 2023 and
+2024 is more volatile — it's extrapolating aggressively from just one or
+two lags of data.
+
+**Bornhuetter-Ferguson** tempers that volatility by anchoring the
+immature years to an a priori expectation. For 2024 (only one lag
+visible), BF is largely driven by expected losses — which is the
+appropriate behavior. As more data matures, BF naturally converges
+toward the Chain Ladder result.
+
+In practice, actuaries use **both methods** (and often others, like the
+Benktander method or Cape Cod) and apply professional judgment to select
+or blend estimates. No single method is always right — the goal is a
+reasonable, defensible reserve that ensures the insurer can pay its
+obligations to policyholders.
+
+------------------------------------------------------------------------
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
+------------------------------------------------------------------------
+
+*This analysis uses fully synthetic data and is intended for educational
+and portfolio demonstration purposes only. It does not represent the
+financials of any real insurance company.*
