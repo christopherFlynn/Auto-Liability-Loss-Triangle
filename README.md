@@ -2,9 +2,12 @@
 
 > An end-to-end actuarial reserving analysis built in R Markdown — from synthetic claims data generation through loss triangle construction and two industry-standard reserve estimation methods.
 
----
+[![R Language](https://img.shields.io/badge/R-4.3+-276DC3?style=flat&logo=r&logoColor=white)](https://www.r-project.org/)
+[![Tidyverse](https://img.shields.io/badge/Tidyverse-2.0.0+-8331A7?style=flat&logo=tidyverse&logoColor=white)](https://www.tidyverse.org/)
+[![Actuarial Science](https://img.shields.io/badge/Domain-P%26C-0D2340?style=flat)](https://www.casact.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-22C55E?style=flat)](LICENSE)
 
-[View the R Publication](https://rpubs.com/christopherflynndev/loss_reserving_CLBF)
+---
 
 ## Overview
 
@@ -14,6 +17,12 @@ One of the most important challenges in insurance is knowing how much money to s
 - **Bornhuetter-Ferguson (BF)** — blends observed data with an independent a priori expected loss estimate for more stable projections on immature accident years
 
 The analysis is written for a general professional audience: actuarial concepts are explained in plain language throughout, making it accessible to analysts, data scientists, and finance professionals who may be new to insurance reserving.
+
+---
+
+## Live Demo
+
+> **[→ View the R Publication](https://rpubs.com/christopherflynndev/loss_reserving_CLBF)**
 
 ---
 
@@ -89,7 +98,7 @@ The rendered report includes:
 
 ---
 
-## Data Notes
+## Data Notes/Disclaimer
 
 All claims data in this project is **fully synthetic** and generated programmatically using `set.seed(42)` for reproducibility. It is designed to mimic realistic auto liability development patterns but does not represent the financials of any real insurance company or book of business.
 
@@ -109,7 +118,7 @@ The a priori loss ratios used in the BF method (ranging from 0.70 to 0.73) are i
 ## Author
 
 **Christopher Flynn**
-- 🌐 [christopherflynn.dev](https://yourwebsite.com)
+- 🌐 [Website](christopherflynn.dev)
 - 💼 [LinkedIn](https://www.linkedin.com/in/christopherflynndev/)
 - 🐙 [GitHub](https://github.com/christopherFlynn)
 
@@ -118,7 +127,3 @@ The a priori loss ratios used in the BF method (ranging from 0.70 to 0.73) are i
 ## License
 
 This project is open source and available under the [MIT License](LICENSE).
-
----
-
-*Built with R, R Markdown, tidyverse, and kableExtra.*
